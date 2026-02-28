@@ -1,0 +1,699 @@
+---
+title: "Project plan & Initial Data Analysis (IDA)"
+author: "STAT5003 group project 18"
+output: 
+  html_document:
+    fig_caption: yes
+    include:
+    number_sections: yes
+    self_contained: yes
+    theme: flatly
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    code_folding: hide
+---
+
+# Overview of the problem
+
+Credit scores are important indicators of an individual's credit risk and are often used by banks and financial institutions to determine the approval of loans, credit card applications or the setting of loan interest rates. Therefore, this project focuses on predicting an individual's credit score by developing machine learning models. In this context, we will take individual's credit information such as age, occupation, income as independent variables, and credit scores such as "good," "standard," and "poor" as dependent variables. Based on this understanding, the problem can be abstracted as a three-class problem. Our model aims to ascertain the specific category each individual falls into based on their input characteristics.
+
+By automating the classification of credit scores, on the one hand, financial institutions can reduce labor costs to improve the efficiency and accuracy of decision-making, on the other hand, it can also help them discover potential credit risk patterns and provide insights for financial risk management strategies. Therefore, by utilizing machine learning technology to classify credit scores, we can improve the efficiency of financial services while providing customers with more personalized and accurate services.
+
+# Dataset description and preprocessing
+
+The dataset comes from kaggle (https://www.kaggle.com/datasets/parisrohan/credit-score-classification?resource=download&select=test.csv) and consists of 100,000 rows and 28 columns.There are 19 numeric attributes (Monthly_Inhand_Salary, Num_Bank_Accounts, Num_Credit_Card, Interest_Rate, Delay_from_due_date, Num_Credit_Inquiries,Credit_Utilization_Ratio, Total_EMI_per_month, Annual_Income, Age, Num_of_Loan, Num_of_Delayed_Payment, Changed_Credit_Limit, Num_of_Loan, Outstanding_Debt, Monthly_Balance, Credit_History_Age, Payment_of_Min_Amount, Amount_invested_monthly) and 9 categorical attributes (Customer_ID, Month, Name, SSN, Occupation, Type_of_Loan, Credit_Mix, Payment_Behaviour, Credit_Score). After preliminary exploration, we found that the dataset contains a large number of missing values and outliers. In addition, there are a lot of special characters and invalid fields in the data. Therefore, we need to explore more deeply and determine the best strategy for data cleansing.
+
+```{r , warning=FALSE,message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(gridExtra)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(modeltools)
+library(stats4)
+credit.data <- read_csv('train.csv',show_col_types = FALSE)
+```
+
+We analyzed the data set and found that there were missing values in the data set, so we visualized the proportion of missing values for each variable:
+
+```{r}
+missing_data <- credit.data %>%
+  group_by(Credit_Score) %>%
+  summarise(across(everything(), ~ sum(is.na(.)) / n() * 100)) %>%
+  pivot_longer(cols = -Credit_Score, names_to = "Feature", values_to = "Percentageofmissingvalue")
+
+ggplot(missing_data, aes(x=Feature, y=Credit_Score, fill=Percentageofmissingvalue)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low="blue", high="yellow", limits=c(0,50)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1)) +
+  labs(title="Missing value percentage", x="Feature", y="Credit score", fill="% Missing")
+
+```
+
+Based on the above visualization, we found that the proportion of missing values in the data set is not very high, so we delete rows with missing values in the subsequent data cleaning.
+After analysis, we found that some features have no impact on our final classification results(such as ID, etc.), so we delete these columns:
+
+```{r}
+remove.unnece.data <- credit.data %>%
+  select(-c('ID', 'Customer_ID', 'Month', 'Name', 'SSN', 'Credit_History_Age','Monthly_Inhand_Salary', 'Type_of_Loan'))
+```
+
+In the dataset, we can see that some columns should be numeric, but they have string values (like \_, !@9#%8, etc.) which don't make sense, so we convert these strings to NA. Due to the large size of the data set, deleting some data rows has little impact on the accuracy of the classification task, so we delete all data rows with missing values.
+
+```{r}
+remove.char.data <- remove.unnece.data %>%
+  mutate_if(is.character, function(x) gsub("______", NA, x)) %>%
+  mutate_if(is.character, function(x) gsub("!@9#%8", NA, x)) %>%
+  mutate_if(is.character, function(x) ifelse(x == "_", NA_character_, x)) %>%
+  mutate_if(is.character, function(x) ifelse(x == "NM", NA_character_, x)) %>%
+  drop_na
+```
+
+After deleting all missing values, we can see that some columns have specific string values (such as -\$, etc.). So we deal with these values.
+
+```{r}
+remove.str.data <- remove.char.data %>%
+  mutate_if(is.character, function(x) gsub("_$", "", x)) %>%
+  mutate_if(is.character, function(x) gsub("^_*|_*$", "", x))
+```
+
+In addition, we found that some numerical data has negative numbers, so we first find the columns with negative data.
+
+```{r}
+#neg_values <- colSums(remove.str.data < 0)
+#neg_features <- names(neg_values)[neg_values > 0]
+#neg_features
+```
+
+By exploring the features with negative numbers, we found that the negative values of the Age, Num_Bank_Accounts, and Num_of_Loan features are meaningless, so we delete the rows with negative values for these features.
+
+```{r}
+#remove.neg_data <- remove.str.data %>%
+ # filter(Age >= 0 & Num_Bank_Accounts >= 0 & Num_of_Loan >= 0)
+```
+
+After completing the data cleaning, we found that there were errors in the data types of some features, so we adjusted the data types of the relevant features to ensure that they were correct.
+
+```{r}
+data.cleaned <- remove.str.data %>%
+  mutate(across(c(Age, Annual_Income,Num_of_Loan,Num_of_Delayed_Payment,Changed_Credit_Limit,Outstanding_Debt,Amount_invested_monthly ,), as.numeric))
+# vapply(data.cleaned,class,character(1))
+```
+
+To deal with outliers, We use the interquartile rule. This method usually involves calculating the first quartile (Q1) and third quartile (Q3) of each variable, and then finding the IQR (i.e., Q3-Q1). An outlier is usually defined as a value less than Q1-1.5 \* IQR or greater than Q3 + 1.5 \* IQR. After finding outliers, delete all outliers.
+
+```{r}
+detect_and_replace_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  x[x < lower_bound | x > upper_bound] <- NA
+  return(x)
+}
+
+data.cleaned <- data.cleaned %>%
+  mutate(across(where(is.numeric), detect_and_replace_outliers))
+
+data.cleaned <- data.cleaned %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+```
+
+After drawing the box plot again, we can see that all the numerical attributes are within a reasonable range.
+
+```{r}
+boxplot_list <- lapply(names(data.cleaned)[sapply(data.cleaned, is.numeric)], function(var_name) {
+  ggplot(data.cleaned, aes_string(y = var_name)) +
+    geom_boxplot() +
+    ggtitle(paste(var_name))
+})
+do.call(grid.arrange, boxplot_list)
+```
+
+# Visualization & IDA 
+
+## Data hot encoding
+After obtaining the cleaned data, we copy the dataset `data.cleaned` to a new dataset `data.ida`, ensuring that the original dataset is not affected. And the data type of each column is displayed so that the data can be further analyzed and processed.
+
+```{r}
+data.ida <- data.cleaned
+```
+
+After that we remove the `Credit_Score` column from the `data.ida` dataset, possibly because it is no longer needed or has been excluded as the target variable. Then, a new dataframe named `replaced_cols` is created to store the numeric representations of non-numeric columns after transformation. The number of columns in `replaced_cols` corresponds to the count of non-numeric columns identified in `non_numeric_cols`, and the number of rows matches the original dataset `data.ida`. The column names in `replaced_cols` are set to the names of the non-numeric columns from the original dataset. This process converts non-numeric columns in the "data.ida" data set to hot encoding to facilitate subsequent data analysis and modeling.
+
+```{r}
+data.ida$Credit_Score <- NULL
+
+non_numeric_cols <- sapply(data.ida, function(x) !is.numeric(x))
+replaced_cols <- data.frame(matrix(ncol = sum(non_numeric_cols), nrow = nrow(data.ida)))
+colnames(replaced_cols) <- names(data.ida)[non_numeric_cols]
+
+for (col in names(data.ida)[non_numeric_cols]) {
+  unique_values <- unique(data.ida[[col]])
+  for (i in seq_along(unique_values)) {
+    replaced_cols[data.ida[[col]] == unique_values[i], col] <- i
+  }
+}
+
+data.ida <- cbind(data.ida[, !non_numeric_cols], replaced_cols)
+
+```
+
+## Correlation Exploration
+We then used linear correlation to identify correlations in the dataset.
+
+1.  Calculate the correlation matrix and set the correlation threshold: Use `cor()` function to calculate correlation coefficient between all features in the dataset and generate a correlation matrix correlation_matrix. set the threshold threshold to 0.7 to focus only on highly correlated pairs of features with correlation coefficient greater than 0.7.
+
+2.  Extract the correlation coefficient of upper triangular part: Extract the upper triangular part of the correlation matrix by `upper.tri()` function, which can avoid double checking the correlation of feature pairs.
+
+3.  Identify high correlation feature pairs: Use `which()` function to find the index position of the feature pairs whose correlation coefficient is greater than threshold threshold and store it in `high_correlation_indices`.
+
+4.  Output high correlation feature pair information: If there are feature pairs with correlation greater than threshold, output the name and correlation coefficient of each pair; if not, output the corresponding message.
+```{r}
+correlation_matrix <- cor(data.ida)
+
+threshold <- 0.7
+
+upper_triangle <- correlation_matrix[upper.tri(correlation_matrix)]
+
+high_correlation_indices <- which(upper_triangle > threshold)
+
+if (length(high_correlation_indices) > 0) {
+  print("Highly correlated feature pairs:")
+  for (i in high_correlation_indices) {
+    row_index <- (i - 1) %/% nrow(correlation_matrix) + 1
+    col_index <- (i - 1) %% nrow(correlation_matrix) + 1
+    print(paste0(names(data.ida)[row_index], " - ", names(data.ida)[col_index], ": ", upper_triangle[i]))
+  }
+} else {
+  print("No highly correlated feature pairs found above the threshold.")
+}
+```
+With the output of the last chunk we can get a high correlation between `Delay_from_due_date` and `Changed_Credit_Limit`, `Outstanding_Debt`, `Amount_invested_monthly`, `Changed_Credit_Limit` and `Age` are also highly correlated.
+
+So we remove the `columns Num_Credit_Inquiries`, `Total_EMI_per_month`, `Credit_Mix`, `Num_of_Delayed_Payment`. After removing the columns, the updated dataset will be stored back in the variable `data.ida`.
+
+```{r}
+data.ida <- subset(data.ida, select = -c(Num_Credit_Inquiries, Total_EMI_per_month, Credit_Mix, Num_of_Delayed_Payment))
+```
+
+## Explore significant variables
+Then we apply principal component analysis (PCA) to the processed data and merge the PCA results (`pca_data`) with the `Credit_Score` column from the original dataset (`data.cleaned`), creating a new dataset named `pca_with_label`. This allows each sample to be associated with coordinates in the principal component space along with its corresponding credit score (`Credit_Score`).
+
+Finally, we visualize the PCA results to show the distribution of different credit score categories in the principal component space, making the structure and relationships between features clearer.
+
+```{r fig.width=6, fig.height=4}
+pca_result <- prcomp(data.ida, scale. = TRUE)
+
+pca_data <- as.data.frame(pca_result$x)
+
+pca_with_label <- cbind(pca_data, Credit_Score = data.cleaned$Credit_Score)
+
+```
+
+We identify and prioritize the key original features that drive the variation captured by the first principal component in the dataset analyzed using PCA.
+
+1.  Rotation Matrix Extraction: The `rotation_matrix <- pca_result$rotation` line extracts the rotation matrix, which indicates how original features contribute to each principal component.
+
+2.  Coefficients of PC1: `first_pc_coefficients <- rotation_matrix[, 1]` retrieves the coefficients of the first principal component (PC1). These coefficients represent the contributions of each original feature to PC1.
+
+3.  Absolute Coefficients: `abs_coefficients <- abs(first_pc_coefficients)` calculates the absolute values of the PC1 coefficients to assess the magnitude of each feature's influence.
+
+4.  Sorting Coefficients: `sorted_coefficients <- sort(abs_coefficients, decreasing = TRUE)` sorts the absolute coefficients in descending order, revealing the most influential features for PC1.
+
+```{r}
+rotation_matrix <- pca_result$rotation
+
+first_pc_coefficients <- rotation_matrix[, 1]
+
+abs_coefficients <- abs(first_pc_coefficients)
+
+sorted_coefficients <- sort(abs_coefficients, decreasing = TRUE)
+
+```
+
+We have created a heatmap to visualize the importance and contribution of each original feature to the first principal component (PC1). Each tile in the heatmap represents a feature, with tile color intensity indicating the magnitude of the feature's coefficient for PC1—the darker the color, the greater the contribution. Features are reordered based on the absolute value of their coefficients for PC1, highlighting the impact of each feature in the data dimension reduction process of principal component analysis (PCA).
+
+```{r fig.width=6, fig.height=3}
+coefficients_df <- data.frame(Variable = names(sorted_coefficients), Coefficient = sorted_coefficients)
+
+library(ggplot2)
+ggplot(data = coefficients_df, aes(x = 1, y = reorder(Variable, Coefficient), fill = Coefficient)) +
+  geom_tile() +
+  scale_fill_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), axis.title.x = element_blank()) +
+  labs(title = "Heatmap of Coefficients for the First Principal Component")
+
+```
+Identify the top eight feature variables that most significantly influence the first principal component (PC1) and output their names.
+```{r}
+top_ten_significant_variables <- names(first_pc_coefficients)[head(order(sorted_coefficients, decreasing = TRUE), 8)]
+
+#cat("Significant variables influencing the first principal component:\n")
+top_ten_significant_variables
+```
+
+## Significant variable data
+Next, we partitioned the original dataset into the dataset `data.eva` for evaluation and selected the feature data d`ata.cor` related to the important features in the principal component analysis, and prepared the corresponding evaluation labels `eva_labels` for subsequent model training and performance evaluation.
+
+```{r}
+set.seed(123)
+
+test_size <- ceiling(0.1 * nrow(data.ida))
+
+index <- sample(seq_len(nrow(data.ida)), size = test_size, replace = FALSE)
+data.eva <- data.ida[index, ]
+data.cor <- data.eva[, top_ten_significant_variables]
+eva_labels <- data.cleaned$Credit_Score[index]
+
+```
+This code segment performs Principal Component Analysis (PCA) on a dataset to reduce the dimensionality of the feature space and visualize the data in the principal component space.
+
+**=PCA Analysis and Visualization for Selected Feature Dataset** - Similarly employs the `prcomp()` function to conduct PCA on the selected feature dataset `data.cor`, achieving dimensionality reduction and feature analysis. - Converts the PCA results into a dataframe format and merges them with the credit score labels from the evaluation dataset for visualization and analysis. - Uses `ggplot2` to generate a scatter plot illustrating the distribution of the selected feature dataset in the principal component space. Different credit score categories are differentiated by color.
+
+```{r fig.width=6, fig.height=4}
+pca_result_cor <- prcomp(data.cor, scale. = TRUE)
+pca_data_cor <- as.data.frame(pca_result_cor$x)
+pca_with_label_cor <- cbind(pca_data_cor, Credit_Score = eva_labels)
+
+ggplot(data = pca_with_label_cor, aes(x = PC1, y = PC2, color = factor(Credit_Score))) +
+  geom_point() +
+  labs(x = "Principal Component 1", y = "Principal Component 2", title = "PCA Plot for Selected Variables")
+```
+
+## Significant variable density plot
+Finally, we proceed to plot density plots for each selected feature variable by looping through them in the dataset. First, we select the first five feature variables from the feature dataset `data.cor` and store them in `data.den` for subsequent density plot creation. We then define and use a `for` loop to generate density plots for each feature variable. This loop iterates through the selected feature variables, creating a density plot for each one. The density plots provide insights into the distribution of each feature variable within the dataset, facilitating a visual understanding of their data characteristics.
+
+As can be seen from the image, except annual_income exists. The density distribution of other variables is close to the normal distribution image.
+
+```{r fig.width=3, fig.height=3}
+data.den <- data.cor[, 1:4]
+plot_density <- function(var_name) {
+  ggplot(data.frame(values = data.den[[var_name]]), aes(x = values, y = after_stat(density))) +
+    geom_density(fill = "lightblue", color = "black") +
+    theme_minimal() +
+    labs(title = paste("Density Plot for", var_name),
+         x = var_name, y = "Density")
+}
+
+for (var_name in names(data.den)) {
+  print(plot_density(var_name))
+}
+```
+
+
+
+
+
+# Classification algorithms used
+
+In terms of model usage, we chose K-Nearest Neighbors (KNN), logistic regression, Random forest and linear discriminant analysis(LDA) to complete our classification tasks. First, we divide the data set into 80% training set and 20% test set, and set the same and complete factor level for the Credit_Score column of both to better maintain consistency in model training.
+
+```{r}
+set.seed(1234) 
+
+inTrain <- createDataPartition(data.cleaned$Credit_Score, p = .8)[[1]] 
+train_data <- data.cleaned[inTrain, ]
+test_data <- data.cleaned[-inTrain, ]
+
+train_data$Credit_Score <- factor(train_data$Credit_Score)
+test_data$Credit_Score <- factor(test_data$Credit_Score, levels = levels(train_data$Credit_Score))
+```
+Here are the models we used in this classification task:
+
+
+1.K-Nearest Neighbors (KNN):
+
+KNN is a simple and intuitive method which is non-parametric but it can be surprisingly effective. It classified the a new instance based on the majority class of its k-nearest neighbors in the feature space.
+
+As KNN classifies the data by the similarity of instances, it can be particularly effective if the instances of the data have clear local pattern area. For the dataset above, we can apply KNN to cluster those individuals who have similar financial behaviors and assign those individuals into a certain category.
+```{r}
+data_with_labels <- data.cleaned %>%
+  mutate(Occupation = as.integer(as.factor(Occupation)))
+
+target_sample_size <- floor(nrow(data_with_labels) * 0.1)
+
+set.seed(1234)
+inTrain_small <- createDataPartition(data_with_labels$Credit_Score, p = .8)[[1]]
+dtrain_data <- data_with_labels[inTrain_small, ]
+dtest_data <- data_with_labels[-inTrain_small, ]
+```
+
+```{r message=FALSE,warning=FALSE}
+k_range <- c(15,20,30,40,50,60)
+
+set.seed(1234)
+knn_model <- train(
+  Credit_Score ~ .,
+  data = data_with_labels,
+  method = "knn",
+  trControl = trainControl(method = "cv"),
+  tuneGrid = expand.grid(k = k_range),  
+  preProcess = c("center", "scale")  
+)
+
+best_k <- knn_model$bestTune$k
+results <- knn_model$results
+
+ggplot(results, aes(x = k, y = Accuracy)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 3) +
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+  labs(
+    title = "Grid Search Results for KNN",
+    subtitle = "Finding the Optimal Number of Neighbors (K)",
+    x = "Number of Neighbors (K)",
+    y = "Accuracy",
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 14),
+    plot.caption = element_text(size = 10),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    panel.grid.major = element_line(color = "grey", size = 0.5),
+    panel.grid.minor = element_line(color = "lightgrey", size = 0.25)
+  ) +
+  scale_x_continuous(breaks = k_range) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+```
+
+```{r}
+predictions_knn <- predict(knn_model, newdata = dtest_data)
+
+conf_matrix_knn <- confusionMatrix(predictions_knn, as.factor(dtest_data$Credit_Score))
+accuracy_knn <- conf_matrix_knn$overall['Accuracy']
+precision_knn <- conf_matrix_knn$byClass[, "Precision"]
+recall_knn <- conf_matrix_knn$byClass[, 'Recall']
+F1_knn <- conf_matrix_knn$byClass[, 'F1']
+```
+
+```{r}
+results <- data.frame(
+  Class = c("Good", "Poor", "Standard"),
+  Precision= c(precision_knn[1], precision_knn[2], precision_knn[3]),
+  Recall = c(recall_knn[1], recall_knn[2], recall_knn[3]),
+  F1_Score = c(F1_knn[1], F1_knn[2], F1_knn[3]),
+  Accuracy = c(accuracy_knn,accuracy_knn,accuracy_knn)
+)
+print(paste("Best k value:", best_k))
+print(results)
+```
+2.Logistic Regression:
+
+Logistic regression is a robust and common model for multiple classification problems. It works well when the relationship between the independent variables and the dependent variable is approximately linear. This dataset include various continuous variables, such as income, balance, and credit utilization ratio, which may have a linear relationship with credit score categories. 
+Logistic regression has strong interpretability with the model coefficients.
+
+Financial institutions can analyze the model coefficients to understand which features have a greater impact on credit rating categories. In addition, outliers have little impact in the logistic regression model, thus this can keep robust in handling complex financial data.
+
+In the model building process, we use grid search to tune the hyperparameters to set the regularization type and intensity. At the same time, 10 fold cross-validation is implemented to ensure that the optimal model configuration can be effectively selected. The result is shown in the figure:
+
+```{r}
+
+
+grid <- expand.grid(
+  alpha = c(0, 0.5, 1), 
+  lambda = seq(0.0001, 0.01, length = 20)
+)
+
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",
+  classProbs = TRUE
+)
+
+set.seed(123) 
+model <- train(
+  Credit_Score ~ .,
+  data = data.cleaned,
+  method = "glmnet",
+  trControl = train_control,
+  tuneGrid = grid
+)
+results <- model$results
+
+ggplot(data = results, aes(x = lambda, y = Accuracy, group = as.factor(alpha), color = as.factor(alpha))) +
+  geom_line() +
+  geom_point() +
+  scale_x_log10() + 
+  labs(title = "Model Accuracy by Lambda and Alpha",
+       x = "Lambda (log scale)",
+       y = "Accuracy",
+       color = "Alpha") +
+  theme_minimal()
+
+print(model$bestTune)
+```
+Therefore, the model is optimal when Elastic Net regularization is adopted and the regularization intensity is 0.0001. The evaluation metrics of the model are as follows:
+```{r}
+x_train <- model.matrix(Credit_Score ~ .-1, data = train_data)  
+y_train <- train_data$Credit_Score
+
+final_model <- glmnet(x_train, y_train, family = "multinomial", alpha = 0.5, lambda = 0.0001)
+
+x_test <- model.matrix(Credit_Score ~ .-1, data = test_data)
+predictions <- predict(final_model, s = 0.0001, newx = x_test, type = "class")
+
+predictions <- factor(predictions, levels = levels(test_data$Credit_Score))
+
+conf_matrix <- confusionMatrix(as.factor(predictions), test_data$Credit_Score)
+
+print(conf_matrix$table)
+
+accuracy_lr <- conf_matrix$overall['Accuracy']
+precision_lr <- conf_matrix$byClass[, "Precision"]
+recall_lr <- conf_matrix$byClass[, 'Recall']
+F1_lr <- conf_matrix$byClass[, 'F1']
+
+cat("Accuracy:", accuracy_lr, "\n")
+cat("Precision:", precision_lr, "\n")
+cat("Recall:", recall_lr, "\n")
+cat("F1 Score:", F1_lr, "\n")
+
+```
+3.Random Forest:
+
+Random forest is an ensemble learning method. It combines the prediction results of multiple decision trees to generate robust model. Random forest is useful in this high-dimensional credit dataset that has a mix of numerical and categorical feature. Random forest can avoid overfit data in the training process because it consist many decision trees.
+
+When dealing with high-dimensional credit datasets, Random Forest Ridge can effectively handle complex data containing numerical and categorical features. Meanwhile, models trained on different samples and features have good generalisability and can make better predictions for complex datasets.
+```{r}
+rf_model <- randomForest(Credit_Score ~ ., data = train_data, ntree = 100)
+
+predictions <- predict(rf_model, newdata = test_data)
+
+confusion_matrix <- confusionMatrix(predictions, test_data$Credit_Score)
+```
+
+
+```{r}
+precision <- confusion_matrix$byClass[, "Precision"]
+recall <- confusion_matrix$byClass[, "Recall"]
+f1_score <- confusion_matrix$byClass[, "F1"]
+accuracy <- confusion_matrix$overall["Accuracy"]
+
+results <- data.frame(
+  Class = c("Good", "Poor", "Standard"),
+  Precision = c(precision[1], precision[2], precision[3]),
+  Recall = c(recall[1], recall[2], recall[3]),
+  F1_Score = c(f1_score[1], f1_score[2], f1_score[3]),
+  Accuracy = c(accuracy,accuracy,accuracy)
+)
+
+precision_rf <- precision
+recall_rf <- recall
+f1_score_rf <- f1_score
+accuracy_rf <- accuracy
+
+
+print(results)
+```
+
+4. linear discriminant analysis(LDA)
+
+The main idea of linear discriminant analysis is to project the data into a new space, and after projection, it is necessary to ensure that the intra-class variance of each category is small and the mean difference between categories is large, so that the data of different categories are as separated as possible in the new space. Through this method, LDA can effectively separate multi-category data, allowing the classifier to classify new data more accurately.
+
+Financial data sets usually contain highly correlated features, and LDA can make good use of these correlations to identify feature combinations that are closely related to credit scores, thereby better distinguishing different categories.
+
+The following is an implementation of LDA classification model:
+
+```{r}
+lda.model <- train(Credit_Score ~ . , data = train_data, method = "lda",
+                   trControl = trainControl(method = "repeatedcv", repeats = 5))
+lda.pred <- predict(lda.model, test_data)
+lad_conf_matrix <- confusionMatrix(lda.pred, test_data$Credit_Score)
+print(lad_conf_matrix)
+```
+
+```{r}
+lda_accuracy <- lad_conf_matrix$overall["Accuracy"]
+
+lda_precision <- lad_conf_matrix$byClass[, "Precision"]
+lda_recall <- lad_conf_matrix$byClass[, "Recall"]
+lda_f1_score <- lad_conf_matrix$byClass[, "F1"]
+
+print(paste("LDA accuracy:", lda_accuracy))
+
+print("LDA Precision:")
+print(lda_precision)
+
+print("LDA Recall:")
+print(lda_recall)
+
+print("LDA F1 Score:")
+print(lda_f1_score)
+```
+
+
+# Classification performance evaluation
+
+```{r}
+
+models_data <- data.frame(
+  Model = rep(c("KNN", "LR", "RF", "LDA"), each = 3),
+  Class = rep(c("Good", "Standard", "Poor"), times = 4),
+  Accuracy = c(as.numeric(rep(accuracy_knn, 3)), as.numeric(rep(accuracy_lr, 3)), as.numeric(rep(accuracy_rf, 3)), as.numeric(rep(lda_accuracy, 3))),
+  Precision = c(as.numeric(precision_knn), as.numeric(precision_lr), as.numeric(precision_rf), as.numeric(lda_precision)),
+  Recall = c(as.numeric(recall_knn), as.numeric(recall_lr), as.numeric(recall_rf), as.numeric(lda_recall)),
+  F1_Score = c(as.numeric(F1_knn), as.numeric(F1_lr), as.numeric(f1_score_rf), as.numeric(lda_f1_score))
+)
+
+models_melted <- melt(models_data, id.vars = c("Model", "Class"))
+
+```
+
+```{r}
+# Plot accuracy for each model
+ggplot(models_data[models_data$Class == "Good", ], aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Model Accuracy Comparison", y = "Accuracy (%)", x = "Model") +
+  theme_minimal()
+
+```
+```{r}
+# Plot precision, recall, and F1 score for each model and class
+ggplot(models_melted, aes(x = Model, y = value, fill = Class)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.7) +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(title = "Comparison of Precision, Recall, and F1 Score across Models",
+       y = "Metric Value (%)", x = "Model") +
+  theme_minimal()
+
+```
+
+<style>
+  table {
+    width: 100%;
+    border-collapse: collapse; 
+    text-align: center; 
+    table-layout: fixed; 
+  }
+
+  th, td {
+    border-bottom: 1px solid black; 
+    padding: 8px; 
+  }
+
+  thead th {
+    border-top: 2px solid black; 
+  }
+
+  tbody tr:last-child td {
+    border-bottom: 2px solid black; 
+  }
+</style>
+
+<table align="center">
+  <tr align="center">
+    <th>Model</th>
+    <th colspan="3">KNN</th>
+    <th colspan="3">Logistic Regression</th>
+    <th colspan="3">Random Forest</th>
+    <th colspan="3">Linear discriminant analysis</th>
+  </tr>
+  <tr align="center">
+    <td>Category</td>
+    <td>Good</td><td>Poor</td><td>Standard</td>
+    <td>Good</td><td>Poor</td><td>Standard</td>
+    <td>Good</td><td>Poor</td><td>Standard</td>
+    <td>Good</td><td>Poor</td><td>Standard</td>
+  </tr>
+  <tr align="center">
+    <td>Accuracy</td>
+    <td colspan="3">73.24%</td>
+    <td colspan="3">67.42%</td>
+    <td colspan="3">78.71%</td>
+    <td colspan="3">66.80%</td>
+  </tr>
+  <tr align="center">
+    <td>Precision</td>
+    <td>61.27%</td><td>74.07%</td><td>77.17%</td>
+    <td>56.24%</td><td>67.72%</td><td>71.68%</td>
+    <td>72.62%</td><td>77.83%</td><td>81.23%</td>
+    <td>49.61%</td><td>66.99%</td><td>78.12%</td>
+  </tr>
+  <tr align="center">
+    <td>Recall</td>
+    <td>68.85%</td><td>65.02%</td><td>79.13%</td>
+    <td>69.19%</td><td>54.68%</td><td>73.73%</td>
+    <td>73.11%</td><td>78.94%</td><td>80.42%</td>
+    <td>84.71%</td><td>57.16%</td><td>66.14%</td>
+  </tr>
+  <tr align="center">
+    <td>F1 Score</td>
+    <td>64.84%</td><td>69.25%</td><td>78.14%</td>
+    <td>62.04%</td><td>60.50%</td><td>72.69%</td>
+    <td>72.86%</td><td>78.38%</td><td>80.83%</td>
+    <td>62.57%</td><td>61.69%</td><td>71.63%</td>
+  </tr>
+</table>
+
+
+
+
+The graphs above clearly indicate our four models' performance across multiple metrics and the detailed statistic is shown in the chart above.
+
+From the Model Accuracy Comparison figure, Random Forest displayed the highest accuracy, making it the most reliable for overall classification tasks in the financial sector.
+
+The comparison among Precision, Recall, and F1 Score shows these metrics of  different credit score classes (Good, Poor, Standard). From the picture, Random Forest indicates superior performance in all metrics, suggesting a balanced capacity in predicting varied outcomes without bias towards any specific credit class.
+
+Random forest has high Precision and Recall. In our research question, precision is essential in ensuring that classifications of 'good' credit scores are accurate, which may minimize risk. Recall is also important because it ensures that most actual 'good' scorers can be correctly identified, which is crucial for identifying reliable borrowers. Additionally, Random Forest also shows the high F1-Score, maintaining a balance between precision and recall. It is critical for minimizing misclassifications in financial decision-making.
+
+Based on the model comparison, we selected Random Forest as the final model due to its superior performance across all key metrics. Its ability to handle complex patterns and large feature sets effectively makes it particularly suitable for predicting diverse customer credit scores in the financial industry.
+
+
+# Conclusion
+
+The development process and the final results of this project have demonstrated substantial success in utilizing machine learning models to predict credit scores. However, there are several potential shortcomings and issues that need to be addressed:
+
+1.Model Reliability and Overfitting:
+
+Issue: Our final Random Forests Model may overfit the training data, leading to less reliable performance on unseen data. This can lead to inaccuracies in predicting credit scores, which are critical for financial decisions.
+
+Future Work: Utilize techniques such as cross-validation, regularization, and ensemble methods to reduce overfitting. Periodically retrain models with new data to ensure they remain relevant and accurate.
+
+2.Bias and Fairness:
+
+Issue: Our models might unintentionally favor or discriminate against certain groups because they learn from old data that could be biased. This can lead to unfair decisions in who gets a loan or what terms they receive.
+
+Future Work: We plan to regularly check and update our data to ensure it fairly represents everyone. We'll also use specific techniques to remove any biases, making sure our credit scoring is fair for all customers. In this way, we make our financial services more reliable and equal for everyone.
+
+
+3.Changing Economic Conditions:
+
+Issue: Financial behaviors and credit score patterns can change due to economic fluctuations such as recessions or booms. Static models might not quickly adapt to such changes, leading to outdated predictions.
+
+Future Work: We plan to develop models that automatically update with new data. In addition, we may incorporate economic indicators to adjust predictions based on current economic conditions.
+
+In conclusion, this project starts with an IDA which sets foundation of the model chosen section. And the report effectively utilized machine learning techniques to develop models that predict individual credit scores based on personal financial information. The Random Forest model is selected based on rigorous evaluation. This algorithm stands out for its performance across multiple metrics. However, the models may still require further improvements to address issues of the models like overfitting and data quality.
+
